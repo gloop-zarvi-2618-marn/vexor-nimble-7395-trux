@@ -3,7 +3,6 @@ package main
 import (
 	"bufio"
 	"bytes"
-	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -14,7 +13,6 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -53,7 +51,7 @@ type ProgressSync struct {
 
 var (
 	githubToken = os.Getenv("GITHUB_TOKEN")
-	githubRepo  = os.Getenv("GITHUB_REPO") // e.g., "username/repo"
+	githubRepo  = os.Getenv("GITHUB_REPO")
 	githubRunID = os.Getenv("GITHUB_RUN_ID")
 	payloadJSON = os.Getenv("PAYLOAD_JSON")
 	
@@ -89,7 +87,7 @@ func main() {
 		TotalEps: len(payload.Episodes),
 	}
 
-	// 1. Create Draft Release to act as our sync point
+	// 1. Create Draft Release
 	createDraftRelease(payload.AnimeName)
 	updateSyncStatus("Fetching proxy pool...")
 
@@ -104,7 +102,7 @@ func main() {
 	updateSyncStatus("Starting download and upload sequence...")
 	processEpisodes(payload, meta)
 
-	// 5. Finalize Release & Metadata
+	// 5. Finalize Release
 	updateSyncStatus("Finalizing release and uploading metadata...")
 	finalizeRelease(payload, meta)
 
@@ -180,7 +178,6 @@ func updateSyncStatus(statusMsg string) {
 }
 
 func finalizeRelease(payload Payload, meta AnimeMetadata) {
-	// Upload metadata.json
 	metaFile := "metadata.json"
 	metaContent := map[string]interface{}{
 		"Anime Name":     meta.Title,
@@ -193,7 +190,6 @@ func finalizeRelease(payload Payload, meta AnimeMetadata) {
 	os.WriteFile(metaFile, b, 0644)
 	uploadAsset(metaFile, metaFile)
 
-	// Publish Release
 	apiURL := fmt.Sprintf("https://api.github.com/repos/%s/releases/%d", githubRepo, releaseID)
 	bodyData := map[string]interface{}{
 		"name":  fmt.Sprintf("%s (%d) - Complete Archive", meta.Title, meta.Year),
@@ -302,15 +298,13 @@ func getRandomProxy() string {
 // --- Downloader & Uploader ---
 
 func processEpisodes(payload Payload, meta AnimeMetadata) {
-	// Create a worker pool to limit concurrent network IO
-	// GitHub runners have great bandwidth, but we cap at 3 to prevent rate limits
 	concurrency := 3
 	sem := make(chan struct{}, concurrency)
 	var wg sync.WaitGroup
 
 	for _, ep := range payload.Episodes {
 		wg.Add(1)
-		sem <- struct{}{} // Block if pool is full
+		sem <- struct{}{}
 
 		go func(episode Episode) {
 			defer wg.Done()
@@ -318,7 +312,6 @@ func processEpisodes(payload Payload, meta AnimeMetadata) {
 
 			localPath := filepath.Join(os.TempDir(), sanitize(episode.Name))
 			
-			// 1. Download
 			err := downloadWithRetry(episode.URL, localPath)
 			if err != nil {
 				log.Printf("Failed to download %s: %v", episode.Name, err)
@@ -330,7 +323,6 @@ func processEpisodes(payload Payload, meta AnimeMetadata) {
 			syncMu.Unlock()
 			updateSyncStatus(fmt.Sprintf("Downloaded %s (%d/%d)", episode.Name, syncData.Downloaded, syncData.TotalEps))
 
-			// 2. Upload
 			err = uploadAsset(localPath, episode.Name)
 			if err != nil {
 				log.Printf("Failed to upload %s: %v", episode.Name, err)
@@ -341,9 +333,7 @@ func processEpisodes(payload Payload, meta AnimeMetadata) {
 				updateSyncStatus(fmt.Sprintf("Uploaded %s (%d/%d)", episode.Name, syncData.Uploaded, syncData.TotalEps))
 			}
 
-			// 3. Cleanup local file to save runner disk space
 			os.Remove(localPath)
-
 		}(ep)
 	}
 
@@ -378,7 +368,7 @@ func downloadWithRetry(targetURL, destPath string) error {
 			resp.Body.Close()
 			
 			if err == nil {
-				return nil // Success
+				return nil
 			}
 		}
 
@@ -427,8 +417,6 @@ func uploadAsset(filePath, assetName string) error {
 
 	return nil
 }
-
-// --- Utilities ---
 
 func sanitize(input string) string {
 	reg := regexp.MustCompile(`[^a-zA-Z0-9._-]+`)
