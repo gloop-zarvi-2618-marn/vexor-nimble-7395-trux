@@ -60,6 +60,10 @@ var (
 	
 	proxyPool   []string
 	proxyMu     sync.Mutex
+	proxyOnce   sync.Once
+	
+	directCooldown time.Time
+	cooldownMu     sync.RWMutex
 	
 	syncData    ProgressSync
 	syncMu      sync.Mutex
@@ -89,20 +93,16 @@ func main() {
 
 	// 1. Create Draft Release
 	createDraftRelease(payload.AnimeName)
-	updateSyncStatus("Fetching proxy pool...")
 
-	// 2. Fetch Proxies
-	fetchProxies()
-
-	// 3. Metadata Enrichment
+	// 2. Metadata Enrichment
 	updateSyncStatus("Enriching metadata via Jikan API...")
 	meta := fetchMetadata(payload.AnimeName)
 
-	// 4. Download & Upload Episodes
+	// 3. Download & Upload Episodes
 	updateSyncStatus("Starting download and upload sequence...")
 	processEpisodes(payload, meta)
 
-	// 5. Finalize Release
+	// 4. Finalize Release
 	updateSyncStatus("Finalizing release and uploading metadata...")
 	finalizeRelease(payload, meta)
 
@@ -229,7 +229,7 @@ func generateReleaseBody(meta AnimeMetadata, isDraft bool) string {
 *All episodes have been processed and uploaded as direct release assets below.*`, meta.Title, meta.Year, meta.PosterImage, meta.Synopsis, syncData.TotalEps)
 }
 
-// --- Metadata & Proxies ---
+// --- Metadata & Smart Proxy Logic ---
 
 func fetchMetadata(query string) AnimeMetadata {
 	apiURL := "https://api.jikan.moe/v4/anime?q=" + url.QueryEscape(query)
@@ -265,25 +265,30 @@ func fetchMetadata(query string) AnimeMetadata {
 	return AnimeMetadata{Title: query}
 }
 
-func fetchProxies() {
-	resp, err := http.Get(proxyListURL)
-	if err != nil {
-		log.Println("Warning: Failed to fetch proxy list. Defaulting to direct connections.")
-		return
-	}
-	defer resp.Body.Close()
-
-	scanner := bufio.NewScanner(resp.Body)
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line != "" {
-			if !strings.HasPrefix(line, "http") {
-				line = "http://" + line
-			}
-			proxyPool = append(proxyPool, line)
+func ensureProxiesLoaded() {
+	proxyOnce.Do(func() {
+		log.Println("Network issue or rate limit detected. Fetching proxy pool fallback...")
+		resp, err := http.Get(proxyListURL)
+		if err != nil {
+			log.Println("Warning: Failed to fetch proxy list. Will continue without proxies.")
+			return
 		}
-	}
-	log.Printf("Loaded %d proxies into rotation pool.", len(proxyPool))
+		defer resp.Body.Close()
+
+		proxyMu.Lock()
+		defer proxyMu.Unlock()
+		scanner := bufio.NewScanner(resp.Body)
+		for scanner.Scan() {
+			line := strings.TrimSpace(scanner.Text())
+			if line != "" {
+				if !strings.HasPrefix(line, "http") {
+					line = "http://" + line
+				}
+				proxyPool = append(proxyPool, line)
+			}
+		}
+		log.Printf("Loaded %d proxies into fallback rotation pool.", len(proxyPool))
+	})
 }
 
 func getRandomProxy() string {
@@ -293,6 +298,18 @@ func getRandomProxy() string {
 		return ""
 	}
 	return proxyPool[rand.Intn(len(proxyPool))]
+}
+
+func isDirectAllowed() bool {
+	cooldownMu.RLock()
+	defer cooldownMu.RUnlock()
+	return time.Now().After(directCooldown)
+}
+
+func setDirectCooldown(d time.Duration) {
+	cooldownMu.Lock()
+	defer cooldownMu.Unlock()
+	directCooldown = time.Now().Add(d)
 }
 
 // --- Downloader & Uploader ---
@@ -344,9 +361,20 @@ func downloadWithRetry(targetURL, destPath string) error {
 	maxRetries := 5
 
 	for i := 0; i < maxRetries; i++ {
-		proxy := getRandomProxy()
-		client := &http.Client{Timeout: 15 * time.Minute}
+		useProxy := false
+		
+		// If it's a retry, or if direct connections are currently on cooldown, use a proxy.
+		if i > 0 || !isDirectAllowed() {
+			useProxy = true
+		}
 
+		var proxy string
+		if useProxy {
+			ensureProxiesLoaded()
+			proxy = getRandomProxy()
+		}
+
+		client := &http.Client{Timeout: 15 * time.Minute}
 		if proxy != "" {
 			if pURL, err := url.Parse(proxy); err == nil {
 				client.Transport = &http.Transport{Proxy: http.ProxyURL(pURL)}
@@ -357,6 +385,7 @@ func downloadWithRetry(targetURL, destPath string) error {
 		req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
 
 		resp, err := client.Do(req)
+		
 		if err == nil && resp.StatusCode == 200 {
 			out, err := os.Create(destPath)
 			if err != nil {
@@ -368,15 +397,38 @@ func downloadWithRetry(targetURL, destPath string) error {
 			resp.Body.Close()
 			
 			if err == nil {
-				return nil
+				return nil // Success
 			}
 		}
 
+		statusCode := 0
 		if resp != nil {
+			statusCode = resp.StatusCode
 			resp.Body.Close()
 		}
+
+		logMode := "DIRECT"
+		if useProxy {
+			if proxy != "" {
+				logMode = fmt.Sprintf("PROXY [%s]", proxy)
+			} else {
+				logMode = "PROXY [Fallback to Direct]"
+			}
+		}
 		
-		log.Printf("Download attempt %d failed for %s. Retrying...", i+1, targetURL)
+		log.Printf("Download attempt %d failed for %s via %s (Status: %d, Err: %v). Retrying...", i+1, targetURL, logMode, statusCode, err)
+		
+		// If direct connection failed, trigger a cooldown so subsequent downloads don't waste time getting blocked
+		if !useProxy {
+			if statusCode == 429 {
+				log.Println("Rate limit (429) hit. Cooling down direct connections for 10 minutes.")
+				setDirectCooldown(10 * time.Minute)
+			} else {
+				log.Println("Network/Server error hit. Cooling down direct connections for 2 minutes.")
+				setDirectCooldown(2 * time.Minute)
+			}
+		}
+
 		time.Sleep(2 * time.Second)
 	}
 
