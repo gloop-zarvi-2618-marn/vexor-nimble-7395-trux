@@ -1,0 +1,42 @@
+name: Remote Anime Archiver
+
+on:
+  repository_dispatch:
+    types: [archive_request]
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  archive-and-release:
+    name: Archive ${{ github.event.client_payload.anime_name }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+
+      - name: Execute Archiver Worker
+        env:
+          # Automatically provided by GitHub Actions for API authentication (Release creation)
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          
+          # The JSON payload sent from the local Python web application
+          PAYLOAD_JSON: ${{ toJSON(github.event.client_payload) }}
+          
+          # Repository and Run ID for API callbacks and logging
+          GITHUB_REPO: ${{ github.repository }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+        run: |
+          cd worker
+          
+          # Initialize a temporary Go module to ensure clean execution
+          go mod init archiver-worker
+          
+          # Run the standard-library optimized Go script
+          go run archiver.go
